@@ -1,15 +1,15 @@
 const WebSocket = require("ws");
 const https = require("https");
-const net = require("net");
 
 const TUNNEL_URL =
   "wss://reverse-ws-gateway2-0af9f160c1-test.apps.ir-central1.arvancaas.ir/__tunnel";
+const LOCAL_XRAY_WS_URL = "ws://127.0.0.1:10000/assets/ws";
 
 let reconnectTimer = null;
 let ws = null;
-let retryDelay = 300;
+let retryDelay = 3000;
 
-const tcpStreams = new Map();
+const xrayStreams = new Map();
 
 function scheduleReconnect() {
   if (reconnectTimer) return;
@@ -18,7 +18,7 @@ function scheduleReconnect() {
     reconnectTimer = null;
     connect();
 
-    retryDelay = Math.min(retryDelay + 150, 5000);
+    retryDelay = Math.min(retryDelay + 1000, 10000);
   }, retryDelay);
 }
 
@@ -34,28 +34,30 @@ function sendWs(msg) {
   }
 }
 
-function closeTcpStream(id, reason = "closed") {
-  const socket = tcpStreams.get(id);
-  if (socket) {
-    tcpStreams.delete(id);
+function closeXrayStream(id, reason = "closed") {
+  const localWs = xrayStreams.get(id);
+
+  if (localWs) {
+    xrayStreams.delete(id);
+
     try {
-      socket.destroy();
+      localWs.close();
     } catch {}
   }
 
   sendWs({
-    type: "stream_close",
+    type: "xray_ws_close",
     id,
   });
 
-  console.log("closed tcp stream:", id, reason);
+  console.log("closed local Xray websocket:", id, reason);
 }
 
 function connect() {
   ws = new WebSocket(TUNNEL_URL);
 
   ws.on("open", () => {
-    retryDelay = 300;
+    retryDelay = 3000;
     console.log("connected to PaaS reverse tunnel:", TUNNEL_URL);
   });
 
@@ -117,86 +119,92 @@ function connect() {
       return;
     }
 
-    if (msg.type === "stream_open") {
-      const socket = net.connect({
-        host: msg.targetHost || "127.0.0.1",
-        port: msg.targetPort || 10000,
+    if (msg.type === "xray_ws_open") {
+      const localWs = new WebSocket(LOCAL_XRAY_WS_URL);
+
+      xrayStreams.set(msg.id, localWs);
+
+      localWs.on("open", () => {
+        console.log("opened websocket to local Xray:", msg.id);
       });
 
-      socket.setNoDelay(true);
-      tcpStreams.set(msg.id, socket);
-
-      socket.on("connect", () => {
-        console.log("opened stream to Xray:", msg.id);
-
-        if (msg.initial) {
-          socket.write(Buffer.from(msg.initial, "base64"), (err) => {
-            if (err) {
-              console.error("initial write error:", msg.id, err.message);
-              closeTcpStream(msg.id, err.message);
-            }
-          });
-        }
-      });
-
-      socket.on("data", (chunk) => {
+      localWs.on("message", (data, isBinary) => {
         const ok = sendWs({
-          type: "stream_data",
+          type: "xray_ws_data",
           id: msg.id,
-          data: chunk.toString("base64"),
+          data: Buffer.from(data).toString("base64"),
+          binary: isBinary,
         });
 
         if (!ok) {
-          closeTcpStream(msg.id, "failed to send stream_data");
+          closeXrayStream(msg.id, "failed to send xray_ws_data");
         }
       });
 
-      socket.on("close", () => {
-        if (tcpStreams.has(msg.id)) {
-          tcpStreams.delete(msg.id);
+      localWs.on("close", (code, reason) => {
+        if (xrayStreams.has(msg.id)) {
+          xrayStreams.delete(msg.id);
+
+          console.log(
+            "local Xray websocket closed:",
+            msg.id,
+            "code=",
+            code,
+            "reason=",
+            reason.toString() || "(empty)",
+          );
+
           sendWs({
-            type: "stream_close",
+            type: "xray_ws_close",
             id: msg.id,
           });
         }
       });
 
-      socket.on("error", (err) => {
-        console.error("tcp stream error:", msg.id, err.message);
-        closeTcpStream(msg.id, err.message);
+      localWs.on("error", (err) => {
+        console.error("local Xray websocket error:", msg.id, err.message);
+        closeXrayStream(msg.id, err.message);
       });
 
       return;
     }
 
-    if (msg.type === "stream_data") {
-      const socket = tcpStreams.get(msg.id);
+    if (msg.type === "xray_ws_data") {
+      const localWs = xrayStreams.get(msg.id);
 
-      if (!socket || socket.destroyed || !socket.writable) {
-        tcpStreams.delete(msg.id);
+      if (!localWs || localWs.readyState !== WebSocket.OPEN) {
+        xrayStreams.delete(msg.id);
+
         sendWs({
-          type: "stream_close",
+          type: "xray_ws_close",
           id: msg.id,
         });
+
         return;
       }
 
-      socket.write(Buffer.from(msg.data || "", "base64"), (err) => {
-        if (err) {
-          console.error("tcp stream write error:", msg.id, err.message);
-          closeTcpStream(msg.id, err.message);
-        }
-      });
+      try {
+        localWs.send(Buffer.from(msg.data || "", "base64"), {
+          binary: msg.binary !== false,
+        });
+      } catch (err) {
+        console.error("local Xray websocket send error:", msg.id, err.message);
+        closeXrayStream(msg.id, err.message);
+      }
 
       return;
     }
 
-    if (msg.type === "stream_close") {
-      const socket = tcpStreams.get(msg.id);
-      if (!socket) return;
+    if (msg.type === "xray_ws_close") {
+      const localWs = xrayStreams.get(msg.id);
+      if (!localWs) return;
 
-      tcpStreams.delete(msg.id);
-      socket.destroy();
+      xrayStreams.delete(msg.id);
+
+      try {
+        localWs.close();
+      } catch {}
+
       return;
     }
   });
@@ -211,13 +219,13 @@ function connect() {
       "reconnecting...",
     );
 
-    for (const socket of tcpStreams.values()) {
+    for (const localWs of xrayStreams.values()) {
       try {
-        socket.destroy();
+        localWs.close();
       } catch {}
     }
 
-    tcpStreams.clear();
+    xrayStreams.clear();
     scheduleReconnect();
   });
 
