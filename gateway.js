@@ -127,7 +127,7 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  if (pathname === XHTTP_PATH) {
+  if (pathname === XHTTP_PATH || pathname.startsWith(XHTTP_PATH + "/")) {
     if (!isTunnelConnected()) {
       res.writeHead(502, {
         "content-type": "text/plain",
