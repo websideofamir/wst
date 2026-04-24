@@ -51,22 +51,44 @@ function sendTunnelMessage(msg) {
 }
 
 function closeStream(id, reason = "closed") {
-  const ws = streams.get(id);
-
-  if (ws) {
+  const socket = streams.get(id);
+  if (socket) {
     streams.delete(id);
-
     try {
-      ws.close();
+      socket.destroy();
     } catch {}
   }
 
   sendTunnelMessage({
-    type: "xray_ws_close",
+    type: "stream_close",
     id,
   });
 
-  log("xray websocket closed:", id, reason);
+  log("xray stream closed:", id, reason);
+}
+
+function buildRawHttpUpgradeRequest(req, head) {
+  const lines = [];
+
+  lines.push(`${req.method} ${req.url} HTTP/${req.httpVersion}`);
+
+  for (const [key, value] of Object.entries(req.headers)) {
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        lines.push(`${key}: ${item}`);
+      }
+    } else {
+      lines.push(`${key}: ${value}`);
+    }
+  }
+
+  lines.push("");
+  lines.push("");
+
+  return Buffer.concat([
+    Buffer.from(lines.join("\r\n")),
+    head || Buffer.alloc(0),
+  ]);
 }
 
 const server = http.createServer((req, res) => {
@@ -162,7 +184,6 @@ const server = http.createServer((req, res) => {
 });
 
 const controlWss = new WebSocketServer({ noServer: true });
-const xrayWss = new WebSocketServer({ noServer: true });
 
 server.on("upgrade", (req, socket, head) => {
   const pathname = new URL(req.url, "http://localhost").pathname;
@@ -185,64 +206,61 @@ server.on("upgrade", (req, socket, head) => {
       return;
     }
 
-    xrayWss.handleUpgrade(req, socket, head, (ws) => {
-      xrayWss.emit("connection", ws, req);
+    const id = crypto.randomUUID();
+
+    socket.setNoDelay(true);
+    streams.set(id, socket);
+
+    log("xray stream opened:", id);
+
+    const initial = buildRawHttpUpgradeRequest(req, head);
+
+    const opened = sendTunnelMessage({
+      type: "stream_open",
+      id,
+      targetHost: "127.0.0.1",
+      targetPort: 10000,
+      initial: initial.toString("base64"),
     });
+
+    if (!opened) {
+      closeStream(id, "failed to send stream_open");
+      return;
+    }
+
+    socket.on("data", (chunk) => {
+      const ok = sendTunnelMessage({
+        type: "stream_data",
+        id,
+        data: chunk.toString("base64"),
+      });
+
+      if (!ok) {
+        closeStream(id, "failed to send stream_data");
+      }
+    });
+
+    socket.on("close", () => {
+      if (streams.has(id)) {
+        streams.delete(id);
+        log("xray stream closed:", id);
+        sendTunnelMessage({
+          type: "stream_close",
+          id,
+        });
+      }
+    });
+
+    socket.on("error", (err) => {
+      logError("xray stream error:", id, err.message);
+      closeStream(id, err.message);
+    });
+
     return;
   }
 
   socket.write("HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n");
   socket.destroy();
-});
-
-xrayWss.on("connection", (clientWs) => {
-  const id = crypto.randomUUID();
-
-  streams.set(id, clientWs);
-  log("xray websocket opened:", id);
-
-  sendTunnelMessage({
-    type: "xray_ws_open",
-    id,
-  });
-
-  clientWs.on("message", (data, isBinary) => {
-    const ok = sendTunnelMessage({
-      type: "xray_ws_data",
-      id,
-      data: Buffer.from(data).toString("base64"),
-      binary: isBinary,
-    });
-
-    if (!ok) {
-      closeStream(id, "failed to send xray_ws_data");
-    }
-  });
-
-  clientWs.on("close", (code, reason) => {
-    if (streams.has(id)) {
-      streams.delete(id);
-
-      log(
-        "xray websocket closed:",
-        id,
-        "code=",
-        code,
-        "reason=",
-        reason.toString() || "(empty)",
-      );
-
-      sendTunnelMessage({
-        type: "xray_ws_close",
-        id,
-      });
-    }
-  });
-
-  clientWs.on("error", (err) => {
-    logError("xray websocket error:", id, err.message);
-    closeStream(id, err.message);
-  });
 });
 
 controlWss.on("connection", (ws) => {
@@ -253,9 +271,9 @@ controlWss.on("connection", (ws) => {
       tunnel.close(1000, "replaced by new tunnel");
     } catch {}
 
-    for (const stream of streams.values()) {
+    for (const socket of streams.values()) {
       try {
-        stream.close();
+        socket.destroy();
       } catch {}
     }
 
@@ -288,40 +306,34 @@ controlWss.on("connection", (ws) => {
       return;
     }
 
-    if (msg.type === "xray_ws_data") {
-      const clientWs = streams.get(msg.id);
+    if (msg.type === "stream_data") {
+      const socket = streams.get(msg.id);
 
-      if (!clientWs || clientWs.readyState !== WebSocket.OPEN) {
+      if (!socket || socket.destroyed || !socket.writable) {
         streams.delete(msg.id);
         sendTunnelMessage({
-          type: "xray_ws_close",
+          type: "stream_close",
           id: msg.id,
         });
         return;
       }
 
-      try {
-        clientWs.send(Buffer.from(msg.data || "", "base64"), {
-          binary: msg.binary !== false,
-        });
-      } catch (err) {
-        logError("xray websocket send error:", msg.id, err.message);
-        closeStream(msg.id, err.message);
-      }
+      socket.write(Buffer.from(msg.data || "", "base64"), (err) => {
+        if (err) {
+          logError("xray stream write error:", msg.id, err.message);
+          closeStream(msg.id, err.message);
+        }
+      });
 
       return;
     }
 
-    if (msg.type === "xray_ws_close") {
-      const clientWs = streams.get(msg.id);
-      if (!clientWs) return;
+    if (msg.type === "stream_close") {
+      const socket = streams.get(msg.id);
+      if (!socket) return;
 
       streams.delete(msg.id);
-
-      try {
-        clientWs.close();
-      } catch {}
-
+      socket.destroy();
       return;
     }
   });
@@ -340,9 +352,9 @@ controlWss.on("connection", (ws) => {
       tunnelConnectedAt = null;
     }
 
-    for (const stream of streams.values()) {
+    for (const socket of streams.values()) {
       try {
-        stream.close();
+        socket.destroy();
       } catch {}
     }
 
