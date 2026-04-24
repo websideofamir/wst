@@ -4,7 +4,7 @@ const crypto = require("crypto");
 
 const PORT = 8080;
 const CONTROL_PATH = "/__tunnel";
-const XRAY_PATH = "/__xray";
+const XRAY_PATH = "/assets/ws";
 
 let tunnel = null;
 let tunnelConnectedAt = null;
