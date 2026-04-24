@@ -1,16 +1,17 @@
 const http = require("http");
+const https = require("https");
 const { WebSocketServer } = require("ws");
 const crypto = require("crypto");
 
 const PORT = 8080;
 const CONTROL_PATH = "/__tunnel";
-const XRAY_PATH = "/assets/ws";
+const XHTTP_PATH = "/assets/xhttp";
 
 let tunnel = null;
 let tunnelConnectedAt = null;
 
 const pendingHttp = new Map();
-const streams = new Map();
+const xhttpStreams = new Map();
 
 function iranTimestamp() {
   const now = new Date();
@@ -50,45 +51,27 @@ function sendTunnelMessage(msg) {
   }
 }
 
-function closeStream(id, reason = "closed") {
-  const socket = streams.get(id);
-  if (socket) {
-    streams.delete(id);
+function closeXhttpStream(id, reason = "closed") {
+  const stream = xhttpStreams.get(id);
+
+  if (stream) {
+    xhttpStreams.delete(id);
+
     try {
-      socket.destroy();
+      if (stream.req && !stream.req.destroyed) stream.req.destroy();
+    } catch {}
+
+    try {
+      if (stream.res && !stream.res.destroyed) stream.res.destroy();
     } catch {}
   }
 
   sendTunnelMessage({
-    type: "stream_close",
+    type: "xhttp_close",
     id,
   });
 
-  log("xray stream closed:", id, reason);
-}
-
-function buildRawHttpUpgradeRequest(req, head) {
-  const lines = [];
-
-  lines.push(`${req.method} ${req.url} HTTP/${req.httpVersion}`);
-
-  for (const [key, value] of Object.entries(req.headers)) {
-    if (Array.isArray(value)) {
-      for (const item of value) {
-        lines.push(`${key}: ${item}`);
-      }
-    } else {
-      lines.push(`${key}: ${value}`);
-    }
-  }
-
-  lines.push("");
-  lines.push("");
-
-  return Buffer.concat([
-    Buffer.from(lines.join("\r\n")),
-    head || Buffer.alloc(0),
-  ]);
+  log("xhttp stream closed:", id, reason);
 }
 
 const server = http.createServer((req, res) => {
@@ -124,7 +107,7 @@ const server = http.createServer((req, res) => {
       tunnel: connected ? "connected" : "disconnected",
       connected,
       connectedAt: tunnelConnectedAt,
-      activeStreams: streams.size,
+      activeXhttpStreams: xhttpStreams.size,
       pendingHttpRequests: pendingHttp.size,
     });
     return;
@@ -138,9 +121,86 @@ const server = http.createServer((req, res) => {
         "/__gateway/tunnel-healthz",
         "/__gateway/routes",
         CONTROL_PATH,
-        XRAY_PATH,
+        XHTTP_PATH,
       ],
     });
+    return;
+  }
+
+  if (pathname === XHTTP_PATH) {
+    if (!isTunnelConnected()) {
+      res.writeHead(502, {
+        "content-type": "text/plain",
+        "cache-control": "no-store",
+      });
+      res.end("reverse tunnel is not connected");
+      return;
+    }
+
+    const id = crypto.randomUUID();
+
+    xhttpStreams.set(id, {
+      req,
+      res,
+      responseStarted: false,
+    });
+
+    log("xhttp request opened:", id, req.method, req.url);
+
+    const headers = { ...req.headers };
+    delete headers.host;
+    delete headers.connection;
+    delete headers["content-length"];
+
+    const opened = sendTunnelMessage({
+      type: "xhttp_open",
+      id,
+      method: req.method,
+      url: req.url,
+      headers,
+    });
+
+    if (!opened) {
+      closeXhttpStream(id, "failed to send xhttp_open");
+      return;
+    }
+
+    req.on("data", (chunk) => {
+      const ok = sendTunnelMessage({
+        type: "xhttp_data",
+        id,
+        data: chunk.toString("base64"),
+      });
+
+      if (!ok) {
+        closeXhttpStream(id, "failed to send xhttp_data");
+      }
+    });
+
+    req.on("end", () => {
+      sendTunnelMessage({
+        type: "xhttp_end",
+        id,
+      });
+    });
+
+    req.on("close", () => {
+      const stream = xhttpStreams.get(id);
+      if (stream && !stream.responseStarted) {
+        closeXhttpStream(id, "client request closed before response");
+      }
+    });
+
+    req.on("error", (err) => {
+      closeXhttpStream(id, err.message);
+    });
+
+    res.on("close", () => {
+      if (xhttpStreams.has(id)) {
+        closeXhttpStream(id, "client response closed");
+      }
+    });
+
     return;
   }
 
@@ -197,68 +257,6 @@ server.on("upgrade", (req, socket, head) => {
     return;
   }
 
-  if (pathname === XRAY_PATH) {
-    if (!isTunnelConnected()) {
-      socket.write(
-        "HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\nreverse tunnel is not connected",
-      );
-      socket.destroy();
-      return;
-    }
-
-    const id = crypto.randomUUID();
-
-    socket.setNoDelay(true);
-    streams.set(id, socket);
-
-    log("xray stream opened:", id);
-
-    const initial = buildRawHttpUpgradeRequest(req, head);
-
-    const opened = sendTunnelMessage({
-      type: "stream_open",
-      id,
-      targetHost: "127.0.0.1",
-      targetPort: 10000,
-      initial: initial.toString("base64"),
-    });
-
-    if (!opened) {
-      closeStream(id, "failed to send stream_open");
-      return;
-    }
-
-    socket.on("data", (chunk) => {
-      const ok = sendTunnelMessage({
-        type: "stream_data",
-        id,
-        data: chunk.toString("base64"),
-      });
-
-      if (!ok) {
-        closeStream(id, "failed to send stream_data");
-      }
-    });
-
-    socket.on("close", () => {
-      if (streams.has(id)) {
-        streams.delete(id);
-        log("xray stream closed:", id);
-        sendTunnelMessage({
-          type: "stream_close",
-          id,
-        });
-      }
-    });
-
-    socket.on("error", (err) => {
-      logError("xray stream error:", id, err.message);
-      closeStream(id, err.message);
-    });
-
-    return;
-  }
-
   socket.write("HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n");
   socket.destroy();
 });
@@ -271,13 +269,11 @@ controlWss.on("connection", (ws) => {
       tunnel.close(1000, "replaced by new tunnel");
     } catch {}
 
-    for (const socket of streams.values()) {
-      try {
-        socket.destroy();
-      } catch {}
+    for (const id of xhttpStreams.keys()) {
+      closeXhttpStream(id, "control tunnel replaced");
     }
 
-    streams.clear();
+    xhttpStreams.clear();
   }
 
   tunnel = ws;
@@ -306,34 +302,58 @@ controlWss.on("connection", (ws) => {
       return;
     }
 
-    if (msg.type === "stream_data") {
-      const socket = streams.get(msg.id);
+    if (msg.type === "xhttp_response_start") {
+      const stream = xhttpStreams.get(msg.id);
+      if (!stream || stream.res.destroyed) return;
 
-      if (!socket || socket.destroyed || !socket.writable) {
-        streams.delete(msg.id);
+      stream.responseStarted = true;
+
+      const headers = msg.headers || {};
+      delete headers.connection;
+      delete headers["transfer-encoding"];
+
+      stream.res.writeHead(msg.statusCode || 200, headers);
+      return;
+    }
+
+    if (msg.type === "xhttp_response_data") {
+      const stream = xhttpStreams.get(msg.id);
+      if (!stream || stream.res.destroyed) {
+        xhttpStreams.delete(msg.id);
         sendTunnelMessage({
-          type: "stream_close",
+          type: "xhttp_close",
           id: msg.id,
         });
         return;
       }
 
-      socket.write(Buffer.from(msg.data || "", "base64"), (err) => {
-        if (err) {
-          logError("xray stream write error:", msg.id, err.message);
-          closeStream(msg.id, err.message);
-        }
-      });
+      const chunk = Buffer.from(msg.data || "", "base64");
+
+      try {
+        stream.res.write(chunk);
+      } catch (err) {
+        closeXhttpStream(msg.id, err.message);
+      }
 
       return;
     }
 
-    if (msg.type === "stream_close") {
-      const socket = streams.get(msg.id);
-      if (!socket) return;
+    if (msg.type === "xhttp_response_end") {
+      const stream = xhttpStreams.get(msg.id);
+      if (!stream) return;
 
-      streams.delete(msg.id);
-      socket.destroy();
+      xhttpStreams.delete(msg.id);
+
+      try {
+        stream.res.end();
+      } catch {}
+
+      log("xhttp response ended:", msg.id);
+      return;
+    }
+
+    if (msg.type === "xhttp_close") {
+      closeXhttpStream(msg.id, "remote close");
       return;
     }
   });
@@ -352,13 +372,11 @@ controlWss.on("connection", (ws) => {
       tunnelConnectedAt = null;
     }
 
-    for (const socket of streams.values()) {
-      try {
-        socket.destroy();
-      } catch {}
+    for (const id of xhttpStreams.keys()) {
+      closeXhttpStream(id, "control tunnel disconnected");
     }
 
-    streams.clear();
+    xhttpStreams.clear();
   });
 
   ws.on("error", (err) => {

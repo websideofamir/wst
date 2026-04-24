@@ -1,15 +1,18 @@
 const WebSocket = require("ws");
 const https = require("https");
-const net = require("net");
+const http = require("http");
 
 const TUNNEL_URL =
   "wss://reverse-ws-gateway2-0af9f160c1-test.apps.ir-central1.arvancaas.ir/__tunnel";
 
+const LOCAL_XHTTP_HOST = "127.0.0.1";
+const LOCAL_XHTTP_PORT = 10000;
+
 let reconnectTimer = null;
 let ws = null;
-let retryDelay = 300;
+let retryDelay = 3000;
 
-const tcpStreams = new Map();
+const xhttpRequests = new Map();
 
 function scheduleReconnect() {
   if (reconnectTimer) return;
@@ -18,7 +21,7 @@ function scheduleReconnect() {
     reconnectTimer = null;
     connect();
 
-    retryDelay = Math.min(retryDelay + 150, 5000);
+    retryDelay = Math.min(retryDelay + 1000, 10000);
   }, retryDelay);
 }
 
@@ -34,28 +37,30 @@ function sendWs(msg) {
   }
 }
 
-function closeTcpStream(id, reason = "closed") {
-  const socket = tcpStreams.get(id);
-  if (socket) {
-    tcpStreams.delete(id);
+function closeXhttpRequest(id, reason = "closed") {
+  const item = xhttpRequests.get(id);
+
+  if (item) {
+    xhttpRequests.delete(id);
+
     try {
-      socket.destroy();
+      if (item.req && !item.req.destroyed) item.req.destroy();
     } catch {}
   }
 
   sendWs({
-    type: "stream_close",
+    type: "xhttp_close",
     id,
   });
 
-  console.log("closed tcp stream:", id, reason);
+  console.log("closed local XHTTP request:", id, reason);
 }
 
 function connect() {
   ws = new WebSocket(TUNNEL_URL);
 
   ws.on("open", () => {
-    retryDelay = 300;
+    retryDelay = 3000;
     console.log("connected to PaaS reverse tunnel:", TUNNEL_URL);
   });
 
@@ -117,86 +122,104 @@ function connect() {
       return;
     }
 
-    if (msg.type === "stream_open") {
-      const socket = net.connect({
-        host: msg.targetHost || "127.0.0.1",
-        port: msg.targetPort || 10000,
-      });
+    if (msg.type === "xhttp_open") {
+      const headers = { ...(msg.headers || {}) };
+      headers.host = `${LOCAL_XHTTP_HOST}:${LOCAL_XHTTP_PORT}`;
+      delete headers.connection;
+      delete headers["content-length"];
 
-      socket.setNoDelay(true);
-      tcpStreams.set(msg.id, socket);
+      const req = http.request(
+        {
+          hostname: LOCAL_XHTTP_HOST,
+          port: LOCAL_XHTTP_PORT,
+          path: msg.url,
+          method: msg.method,
+          headers,
+        },
+        (res) => {
+          sendWs({
+            type: "xhttp_response_start",
+            id: msg.id,
+            statusCode: res.statusCode,
+            headers: res.headers,
+          });
 
-      socket.on("connect", () => {
-        console.log("opened stream to Xray:", msg.id);
+          res.on("data", (chunk) => {
+            sendWs({
+              type: "xhttp_response_data",
+              id: msg.id,
+              data: chunk.toString("base64"),
+            });
+          });
 
-        if (msg.initial) {
-          socket.write(Buffer.from(msg.initial, "base64"), (err) => {
-            if (err) {
-              console.error("initial write error:", msg.id, err.message);
-              closeTcpStream(msg.id, err.message);
+          res.on("end", () => {
+            sendWs({
+              type: "xhttp_response_end",
+              id: msg.id,
+            });
+            xhttpRequests.delete(msg.id);
+          });
+
+          res.on("close", () => {
+            if (xhttpRequests.has(msg.id)) {
+              closeXhttpRequest(msg.id, "local xhttp response closed");
             }
           });
-        }
+        },
+      );
+
+      xhttpRequests.set(msg.id, { req });
+
+      req.on("error", (err) => {
+        console.error("local xhttp request error:", msg.id, err.message);
+        closeXhttpRequest(msg.id, err.message);
       });
 
-      socket.on("data", (chunk) => {
-        const ok = sendWs({
-          type: "stream_data",
-          id: msg.id,
-          data: chunk.toString("base64"),
-        });
-
-        if (!ok) {
-          closeTcpStream(msg.id, "failed to send stream_data");
+      req.on("close", () => {
+        if (xhttpRequests.has(msg.id)) {
+          closeXhttpRequest(msg.id, "local xhttp request closed");
         }
-      });
-
-      socket.on("close", () => {
-        if (tcpStreams.has(msg.id)) {
-          tcpStreams.delete(msg.id);
-          sendWs({
-            type: "stream_close",
-            id: msg.id,
-          });
-        }
-      });
-
-      socket.on("error", (err) => {
-        console.error("tcp stream error:", msg.id, err.message);
-        closeTcpStream(msg.id, err.message);
       });
 
       return;
     }
 
-    if (msg.type === "stream_data") {
-      const socket = tcpStreams.get(msg.id);
+    if (msg.type === "xhttp_data") {
+      const item = xhttpRequests.get(msg.id);
 
-      if (!socket || socket.destroyed || !socket.writable) {
-        tcpStreams.delete(msg.id);
+      if (!item || !item.req || item.req.destroyed) {
+        xhttpRequests.delete(msg.id);
         sendWs({
-          type: "stream_close",
+          type: "xhttp_close",
           id: msg.id,
         });
         return;
       }
 
-      socket.write(Buffer.from(msg.data || "", "base64"), (err) => {
-        if (err) {
-          console.error("tcp stream write error:", msg.id, err.message);
-          closeTcpStream(msg.id, err.message);
-        }
-      });
+      try {
+        item.req.write(Buffer.from(msg.data || "", "base64"));
+      } catch (err) {
+        closeXhttpRequest(msg.id, err.message);
+      }
 
       return;
     }
 
-    if (msg.type === "stream_close") {
-      const socket = tcpStreams.get(msg.id);
-      if (!socket) return;
+    if (msg.type === "xhttp_end") {
+      const item = xhttpRequests.get(msg.id);
+      if (!item || !item.req || item.req.destroyed) return;
 
-      tcpStreams.delete(msg.id);
-      socket.destroy();
+      try {
+        item.req.end();
+      } catch (err) {
+        closeXhttpRequest(msg.id, err.message);
+      }
+
+      return;
+    }
+
+    if (msg.type === "xhttp_close") {
+      closeXhttpRequest(msg.id, "remote close");
       return;
     }
   });
@@ -211,13 +234,11 @@ function connect() {
       "reconnecting...",
     );
 
-    for (const socket of tcpStreams.values()) {
-      try {
-        socket.destroy();
-      } catch {}
+    for (const id of xhttpRequests.keys()) {
+      closeXhttpRequest(id, "control tunnel closed");
     }
 
-    tcpStreams.clear();
+    xhttpRequests.clear();
     scheduleReconnect();
   });
 
