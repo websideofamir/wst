@@ -17,9 +17,10 @@
         "decryption": "none"
       },
       "streamSettings": {
-        "network": "ws",
-        "wsSettings": {
-          "path": "/assets/ws"
+        "network": "xhttp",
+        "xhttpSettings": {
+          "path": "/assets/xhttp",
+          "mode": "auto"
         }
       }
     }
