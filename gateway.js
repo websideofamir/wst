@@ -40,8 +40,31 @@ function sendJson(res, statusCode, data) {
 
 function sendTunnelMessage(msg) {
   if (!isTunnelConnected()) return false;
-  tunnel.send(JSON.stringify(msg));
-  return true;
+
+  try {
+    tunnel.send(JSON.stringify(msg));
+    return true;
+  } catch (err) {
+    logError("failed to send tunnel message:", err.message);
+    return false;
+  }
+}
+
+function closeStream(id, reason = "closed") {
+  const socket = streams.get(id);
+  if (socket) {
+    streams.delete(id);
+    try {
+      socket.destroy();
+    } catch {}
+  }
+
+  sendTunnelMessage({
+    type: "stream_close",
+    id,
+  });
+
+  log("xray stream closed:", id, reason);
 }
 
 function buildRawHttpUpgradeRequest(req, head) {
@@ -114,8 +137,8 @@ const server = http.createServer((req, res) => {
         "/__gateway/healthz",
         "/__gateway/tunnel-healthz",
         "/__gateway/routes",
-        "/__tunnel",
-        "/__xray",
+        CONTROL_PATH,
+        XRAY_PATH,
       ],
     });
     return;
@@ -184,13 +207,15 @@ server.on("upgrade", (req, socket, head) => {
     }
 
     const id = crypto.randomUUID();
+
+    socket.setNoDelay(true);
     streams.set(id, socket);
 
     log("xray stream opened:", id);
 
     const initial = buildRawHttpUpgradeRequest(req, head);
 
-    sendTunnelMessage({
+    const opened = sendTunnelMessage({
       type: "stream_open",
       id,
       targetHost: "127.0.0.1",
@@ -198,30 +223,37 @@ server.on("upgrade", (req, socket, head) => {
       initial: initial.toString("base64"),
     });
 
+    if (!opened) {
+      closeStream(id, "failed to send stream_open");
+      return;
+    }
+
     socket.on("data", (chunk) => {
-      sendTunnelMessage({
+      const ok = sendTunnelMessage({
         type: "stream_data",
         id,
         data: chunk.toString("base64"),
       });
+
+      if (!ok) {
+        closeStream(id, "failed to send stream_data");
+      }
     });
 
     socket.on("close", () => {
-      streams.delete(id);
-      log("xray stream closed:", id);
-      sendTunnelMessage({
-        type: "stream_close",
-        id,
-      });
+      if (streams.has(id)) {
+        streams.delete(id);
+        log("xray stream closed:", id);
+        sendTunnelMessage({
+          type: "stream_close",
+          id,
+        });
+      }
     });
 
     socket.on("error", (err) => {
-      streams.delete(id);
       logError("xray stream error:", id, err.message);
-      sendTunnelMessage({
-        type: "stream_close",
-        id,
-      });
+      closeStream(id, err.message);
     });
 
     return;
@@ -233,14 +265,16 @@ server.on("upgrade", (req, socket, head) => {
 
 controlWss.on("connection", (ws) => {
   if (isTunnelConnected()) {
-    console.log("replacing existing control tunnel");
+    log("replacing existing control tunnel");
 
     try {
       tunnel.close(1000, "replaced by new tunnel");
     } catch {}
 
     for (const socket of streams.values()) {
-      socket.destroy();
+      try {
+        socket.destroy();
+      } catch {}
     }
 
     streams.clear();
@@ -252,7 +286,14 @@ controlWss.on("connection", (ws) => {
   log("reverse control tunnel connected");
 
   ws.on("message", (raw) => {
-    const msg = JSON.parse(raw.toString());
+    let msg;
+
+    try {
+      msg = JSON.parse(raw.toString());
+    } catch (err) {
+      logError("invalid tunnel message:", err.message);
+      return;
+    }
 
     if (msg.type === "http_response") {
       const res = pendingHttp.get(msg.id);
@@ -267,9 +308,23 @@ controlWss.on("connection", (ws) => {
 
     if (msg.type === "stream_data") {
       const socket = streams.get(msg.id);
-      if (!socket) return;
 
-      socket.write(Buffer.from(msg.data || "", "base64"));
+      if (!socket || socket.destroyed || !socket.writable) {
+        streams.delete(msg.id);
+        sendTunnelMessage({
+          type: "stream_close",
+          id: msg.id,
+        });
+        return;
+      }
+
+      socket.write(Buffer.from(msg.data || "", "base64"), (err) => {
+        if (err) {
+          logError("xray stream write error:", msg.id, err.message);
+          closeStream(msg.id, err.message);
+        }
+      });
+
       return;
     }
 
@@ -283,8 +338,14 @@ controlWss.on("connection", (ws) => {
     }
   });
 
-  ws.on("close", () => {
-    log("reverse control tunnel disconnected");
+  ws.on("close", (code, reason) => {
+    log(
+      "reverse control tunnel disconnected:",
+      "code=",
+      code,
+      "reason=",
+      reason.toString() || "(empty)",
+    );
 
     if (tunnel === ws) {
       tunnel = null;
@@ -292,7 +353,9 @@ controlWss.on("connection", (ws) => {
     }
 
     for (const socket of streams.values()) {
-      socket.destroy();
+      try {
+        socket.destroy();
+      } catch {}
     }
 
     streams.clear();

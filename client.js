@@ -7,10 +7,9 @@ const TUNNEL_URL =
 
 let reconnectTimer = null;
 let ws = null;
+let retryDelay = 300;
 
 const tcpStreams = new Map();
-
-let retryDelay = 300;
 
 function scheduleReconnect() {
   if (reconnectTimer) return;
@@ -19,26 +18,56 @@ function scheduleReconnect() {
     reconnectTimer = null;
     connect();
 
-    // grow delay gradually (max 5s)
     retryDelay = Math.min(retryDelay + 150, 5000);
   }, retryDelay);
 }
 
 function sendWs(msg) {
   if (!ws || ws.readyState !== WebSocket.OPEN) return false;
-  ws.send(JSON.stringify(msg));
-  return true;
+
+  try {
+    ws.send(JSON.stringify(msg));
+    return true;
+  } catch (err) {
+    console.error("failed to send ws message:", err.message);
+    return false;
+  }
+}
+
+function closeTcpStream(id, reason = "closed") {
+  const socket = tcpStreams.get(id);
+  if (socket) {
+    tcpStreams.delete(id);
+    try {
+      socket.destroy();
+    } catch {}
+  }
+
+  sendWs({
+    type: "stream_close",
+    id,
+  });
+
+  console.log("closed tcp stream:", id, reason);
 }
 
 function connect() {
   ws = new WebSocket(TUNNEL_URL);
 
   ws.on("open", () => {
+    retryDelay = 300;
     console.log("connected to PaaS reverse tunnel:", TUNNEL_URL);
   });
 
   ws.on("message", (raw) => {
-    const msg = JSON.parse(raw.toString());
+    let msg;
+
+    try {
+      msg = JSON.parse(raw.toString());
+    } catch (err) {
+      console.error("invalid tunnel message:", err.message);
+      return;
+    }
 
     if (msg.type === "http_request") {
       const body = Buffer.from(msg.body || "", "base64");
@@ -94,49 +123,58 @@ function connect() {
         port: msg.targetPort || 10000,
       });
 
+      socket.setNoDelay(true);
       tcpStreams.set(msg.id, socket);
 
       socket.on("connect", () => {
         console.log("opened stream to Xray:", msg.id);
 
         if (msg.initial) {
-          socket.write(Buffer.from(msg.initial, "base64"));
+          socket.write(Buffer.from(msg.initial, "base64"), (err) => {
+            if (err) {
+              console.error("initial write error:", msg.id, err.message);
+              closeTcpStream(msg.id, err.message);
+            }
+          });
         }
       });
 
       socket.on("data", (chunk) => {
-        sendWs({
+        const ok = sendWs({
           type: "stream_data",
           id: msg.id,
           data: chunk.toString("base64"),
         });
+
+        if (!ok) {
+          closeTcpStream(msg.id, "failed to send stream_data");
+        }
       });
 
       socket.on("close", () => {
-        tcpStreams.delete(msg.id);
-        sendWs({
-          type: "stream_close",
-          id: msg.id,
-        });
+        if (tcpStreams.has(msg.id)) {
+          tcpStreams.delete(msg.id);
+          sendWs({
+            type: "stream_close",
+            id: msg.id,
+          });
+        }
       });
 
       socket.on("error", (err) => {
-        console.error("xray stream error:", id, err.message);
-        streams.delete(id);
-        sendTunnelMessage({
-          type: "stream_close",
-          id,
-        });
+        console.error("tcp stream error:", msg.id, err.message);
+        closeTcpStream(msg.id, err.message);
       });
 
       return;
     }
 
     if (msg.type === "stream_data") {
-      const socket = streams.get(msg.id);
+      const socket = tcpStreams.get(msg.id);
+
       if (!socket || socket.destroyed || !socket.writable) {
-        streams.delete(msg.id);
-        sendTunnelMessage({
+        tcpStreams.delete(msg.id);
+        sendWs({
           type: "stream_close",
           id: msg.id,
         });
@@ -145,13 +183,8 @@ function connect() {
 
       socket.write(Buffer.from(msg.data || "", "base64"), (err) => {
         if (err) {
-          console.error("xray stream write error:", msg.id, err.message);
-          streams.delete(msg.id);
-          socket.destroy();
-          sendTunnelMessage({
-            type: "stream_close",
-            id: msg.id,
-          });
+          console.error("tcp stream write error:", msg.id, err.message);
+          closeTcpStream(msg.id, err.message);
         }
       });
 
@@ -179,7 +212,9 @@ function connect() {
     );
 
     for (const socket of tcpStreams.values()) {
-      socket.destroy();
+      try {
+        socket.destroy();
+      } catch {}
     }
 
     tcpStreams.clear();
