@@ -184,11 +184,8 @@ const server = http.createServer((req, res) => {
       });
     });
 
-    req.on("close", () => {
-      const stream = xhttpStreams.get(id);
-      if (stream && !stream.responseStarted) {
-        closeXhttpStream(id, "client request closed before response");
-      }
+    req.on("aborted", () => {
+      closeXhttpStream(id, "client request aborted");
     });
 
     req.on("error", (err) => {
