@@ -33,7 +33,7 @@ function isTunnelConnected() {
 function sendJson(res, statusCode, data) {
   res.writeHead(statusCode, {
     "content-type": "application/json",
-    "cache-control": "no-store"
+    "cache-control": "no-store",
   });
   res.end(JSON.stringify(data));
 }
@@ -64,7 +64,7 @@ function buildRawHttpUpgradeRequest(req, head) {
 
   return Buffer.concat([
     Buffer.from(lines.join("\r\n")),
-    head || Buffer.alloc(0)
+    head || Buffer.alloc(0),
   ]);
 }
 
@@ -77,7 +77,7 @@ const server = http.createServer((req, res) => {
     sendJson(res, 200, {
       status: "ok",
       source: "kubernetes",
-      service: "running"
+      service: "running",
     });
     return;
   }
@@ -87,7 +87,7 @@ const server = http.createServer((req, res) => {
       status: "ok",
       source: "manual",
       service: "running",
-      uptimeSeconds: Math.floor(process.uptime())
+      uptimeSeconds: Math.floor(process.uptime()),
     });
     return;
   }
@@ -102,7 +102,7 @@ const server = http.createServer((req, res) => {
       connected,
       connectedAt: tunnelConnectedAt,
       activeStreams: streams.size,
-      pendingHttpRequests: pendingHttp.size
+      pendingHttpRequests: pendingHttp.size,
     });
     return;
   }
@@ -115,15 +115,15 @@ const server = http.createServer((req, res) => {
         "/__gateway/tunnel-healthz",
         "/__gateway/routes",
         "/__tunnel",
-        "/__xray"
-      ]
+        "/__xray",
+      ],
     });
     return;
   }
 
   if (!isTunnelConnected()) {
     res.writeHead(502, {
-      "content-type": "text/plain"
+      "content-type": "text/plain",
     });
     res.end("reverse tunnel is not connected");
     return;
@@ -131,7 +131,7 @@ const server = http.createServer((req, res) => {
 
   const chunks = [];
 
-  req.on("data", chunk => chunks.push(chunk));
+  req.on("data", (chunk) => chunks.push(chunk));
 
   req.on("end", () => {
     const id = crypto.randomUUID();
@@ -143,7 +143,7 @@ const server = http.createServer((req, res) => {
       method: req.method,
       url: req.url,
       headers: req.headers,
-      body: Buffer.concat(chunks).toString("base64")
+      body: Buffer.concat(chunks).toString("base64"),
     });
 
     setTimeout(() => {
@@ -151,7 +151,7 @@ const server = http.createServer((req, res) => {
         pendingHttp.delete(id);
 
         res.writeHead(504, {
-          "content-type": "text/plain"
+          "content-type": "text/plain",
         });
 
         res.end("upstream timeout");
@@ -168,7 +168,7 @@ server.on("upgrade", (req, socket, head) => {
   log("upgrade request:", pathname);
 
   if (pathname === CONTROL_PATH) {
-    controlWss.handleUpgrade(req, socket, head, ws => {
+    controlWss.handleUpgrade(req, socket, head, (ws) => {
       controlWss.emit("connection", ws, req);
     });
     return;
@@ -176,7 +176,9 @@ server.on("upgrade", (req, socket, head) => {
 
   if (pathname === XRAY_PATH) {
     if (!isTunnelConnected()) {
-      socket.write("HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\nreverse tunnel is not connected");
+      socket.write(
+        "HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\nreverse tunnel is not connected",
+      );
       socket.destroy();
       return;
     }
@@ -193,14 +195,14 @@ server.on("upgrade", (req, socket, head) => {
       id,
       targetHost: "127.0.0.1",
       targetPort: 10000,
-      initial: initial.toString("base64")
+      initial: initial.toString("base64"),
     });
 
-    socket.on("data", chunk => {
+    socket.on("data", (chunk) => {
       sendTunnelMessage({
         type: "stream_data",
         id,
-        data: chunk.toString("base64")
+        data: chunk.toString("base64"),
       });
     });
 
@@ -209,16 +211,16 @@ server.on("upgrade", (req, socket, head) => {
       log("xray stream closed:", id);
       sendTunnelMessage({
         type: "stream_close",
-        id
+        id,
       });
     });
 
-    socket.on("error", err => {
+    socket.on("error", (err) => {
       streams.delete(id);
       logError("xray stream error:", id, err.message);
       sendTunnelMessage({
         type: "stream_close",
-        id
+        id,
       });
     });
 
@@ -229,11 +231,19 @@ server.on("upgrade", (req, socket, head) => {
   socket.destroy();
 });
 
-controlWss.on("connection", ws => {
+controlWss.on("connection", (ws) => {
   if (isTunnelConnected()) {
-    log("second control tunnel rejected");
-    ws.close(1013, "control tunnel already connected");
-    return;
+    console.log("replacing existing control tunnel");
+
+    try {
+      tunnel.close(1000, "replaced by new tunnel");
+    } catch {}
+
+    for (const socket of streams.values()) {
+      socket.destroy();
+    }
+
+    streams.clear();
   }
 
   tunnel = ws;
@@ -241,7 +251,7 @@ controlWss.on("connection", ws => {
 
   log("reverse control tunnel connected");
 
-  ws.on("message", raw => {
+  ws.on("message", (raw) => {
     const msg = JSON.parse(raw.toString());
 
     if (msg.type === "http_response") {
@@ -288,7 +298,7 @@ controlWss.on("connection", ws => {
     streams.clear();
   });
 
-  ws.on("error", err => {
+  ws.on("error", (err) => {
     logError("control websocket error:", err.message);
   });
 });
