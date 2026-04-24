@@ -12,6 +12,20 @@ let tunnelConnectedAt = null;
 const pendingHttp = new Map();
 const streams = new Map();
 
+function iranTimestamp() {
+  const now = new Date();
+  const iranTime = new Date(now.getTime() + 3.5 * 60 * 60 * 1000);
+  return iranTime.toISOString().replace("T", " ").replace("Z", " GMT+03:30");
+}
+
+function log(...args) {
+  console.log(`[${iranTimestamp()}]`, ...args);
+}
+
+function logError(...args) {
+  console.error(`[${iranTimestamp()}]`, ...args);
+}
+
 function isTunnelConnected() {
   return tunnel && tunnel.readyState === tunnel.OPEN;
 }
@@ -57,7 +71,7 @@ function buildRawHttpUpgradeRequest(req, head) {
 const server = http.createServer((req, res) => {
   const pathname = new URL(req.url, "http://localhost").pathname;
 
-  console.log("incoming request:", req.method, req.url, "pathname:", pathname);
+  log("incoming request:", req.method, req.url, "pathname:", pathname);
 
   if (pathname === "/k8s-healthz") {
     sendJson(res, 200, {
@@ -151,7 +165,7 @@ const controlWss = new WebSocketServer({ noServer: true });
 server.on("upgrade", (req, socket, head) => {
   const pathname = new URL(req.url, "http://localhost").pathname;
 
-  console.log("upgrade request:", pathname);
+  log("upgrade request:", pathname);
 
   if (pathname === CONTROL_PATH) {
     controlWss.handleUpgrade(req, socket, head, ws => {
@@ -169,6 +183,8 @@ server.on("upgrade", (req, socket, head) => {
 
     const id = crypto.randomUUID();
     streams.set(id, socket);
+
+    log("xray stream opened:", id);
 
     const initial = buildRawHttpUpgradeRequest(req, head);
 
@@ -190,14 +206,16 @@ server.on("upgrade", (req, socket, head) => {
 
     socket.on("close", () => {
       streams.delete(id);
+      log("xray stream closed:", id);
       sendTunnelMessage({
         type: "stream_close",
         id
       });
     });
 
-    socket.on("error", () => {
+    socket.on("error", err => {
       streams.delete(id);
+      logError("xray stream error:", id, err.message);
       sendTunnelMessage({
         type: "stream_close",
         id
@@ -212,10 +230,16 @@ server.on("upgrade", (req, socket, head) => {
 });
 
 controlWss.on("connection", ws => {
-  tunnel = ws;
-  tunnelConnectedAt = new Date().toISOString();
+  if (isTunnelConnected()) {
+    log("second control tunnel rejected");
+    ws.close(1013, "control tunnel already connected");
+    return;
+  }
 
-  console.log("reverse control tunnel connected");
+  tunnel = ws;
+  tunnelConnectedAt = iranTimestamp();
+
+  log("reverse control tunnel connected");
 
   ws.on("message", raw => {
     const msg = JSON.parse(raw.toString());
@@ -250,7 +274,7 @@ controlWss.on("connection", ws => {
   });
 
   ws.on("close", () => {
-    console.log("reverse control tunnel disconnected");
+    log("reverse control tunnel disconnected");
 
     if (tunnel === ws) {
       tunnel = null;
@@ -265,10 +289,10 @@ controlWss.on("connection", ws => {
   });
 
   ws.on("error", err => {
-    console.error("control websocket error:", err.message);
+    logError("control websocket error:", err.message);
   });
 });
 
 server.listen(PORT, "0.0.0.0", () => {
-  console.log("gateway listening on 8080");
+  log("gateway listening on 8080");
 });
