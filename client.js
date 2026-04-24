@@ -2,7 +2,8 @@ const WebSocket = require("ws");
 const https = require("https");
 const net = require("net");
 
-const TUNNEL_URL = "wss://reverse-ws-gateway2-0af9f160c1-test.apps.ir-central1.arvancaas.ir/__tunnel";
+const TUNNEL_URL =
+  "wss://reverse-ws-gateway2-0af9f160c1-test.apps.ir-central1.arvancaas.ir/__tunnel";
 
 let reconnectTimer = null;
 let ws = null;
@@ -120,11 +121,11 @@ function connect() {
       });
 
       socket.on("error", (err) => {
-        console.error("tcp stream error:", msg.id, err.message);
-        tcpStreams.delete(msg.id);
-        sendWs({
+        console.error("xray stream error:", id, err.message);
+        streams.delete(id);
+        sendTunnelMessage({
           type: "stream_close",
-          id: msg.id,
+          id,
         });
       });
 
@@ -132,10 +133,28 @@ function connect() {
     }
 
     if (msg.type === "stream_data") {
-      const socket = tcpStreams.get(msg.id);
-      if (!socket) return;
+      const socket = streams.get(msg.id);
+      if (!socket || socket.destroyed || !socket.writable) {
+        streams.delete(msg.id);
+        sendTunnelMessage({
+          type: "stream_close",
+          id: msg.id,
+        });
+        return;
+      }
 
-      socket.write(Buffer.from(msg.data || "", "base64"));
+      socket.write(Buffer.from(msg.data || "", "base64"), (err) => {
+        if (err) {
+          console.error("xray stream write error:", msg.id, err.message);
+          streams.delete(msg.id);
+          socket.destroy();
+          sendTunnelMessage({
+            type: "stream_close",
+            id: msg.id,
+          });
+        }
+      });
+
       return;
     }
 
